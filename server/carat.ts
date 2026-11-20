@@ -26,6 +26,16 @@ export type CaratCommandOutcome<T> =
 
 const CARAT_BIN = process.env.CARAT_BIN || "carat";
 
+interface ExecFileError {
+  readonly code?: unknown;
+  readonly stdout?: unknown;
+  readonly stderr?: unknown;
+}
+
+function isExecFileError(err: unknown): err is ExecFileError {
+  return typeof err === "object" && err !== null && ("code" in err || "stdout" in err || "stderr" in err);
+}
+
 async function runCaratJson<S extends z.ZodTypeAny>(opts: {
   readonly args: readonly string[];
   readonly cwd: string;
@@ -44,13 +54,10 @@ async function runCaratJson<S extends z.ZodTypeAny>(opts: {
     stdout = res.stdout;
     stderr = res.stderr;
   } catch (err: unknown) {
-    if (typeof err === "object" && err !== null && "code" in err) {
-      const codeVal = (err as { code?: unknown }).code;
-      const outVal = "stdout" in err ? (err as { stdout?: unknown }).stdout : "";
-      const errVal = "stderr" in err ? (err as { stderr?: unknown }).stderr : "";
-      exitCode = typeof codeVal === "number" ? codeVal : 2;
-      stdout = typeof outVal === "string" ? outVal : "";
-      stderr = typeof errVal === "string" ? errVal : "";
+    if (isExecFileError(err)) {
+      exitCode = typeof err.code === "number" ? err.code : 2;
+      stdout = typeof err.stdout === "string" ? err.stdout : "";
+      stderr = typeof err.stderr === "string" ? err.stderr : "";
     } else {
       return {
         kind: "error",

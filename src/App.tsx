@@ -91,11 +91,11 @@ export function App() {
     const query = dir ? `?dir=${encodeURIComponent(dir)}` : "";
     const res = await fetch(`/api/projects${query}`);
     const json = await res.json();
-    if (res.ok) {
+    if (res.ok && typeof json.current === "string") {
       setProjectDir(json.current);
       setDirDraft(json.current);
-      setProjects(json.projects ?? []);
-      return json.current as string;
+      setProjects(Array.isArray(json.projects) ? json.projects : []);
+      return json.current;
     }
     return null;
   }, []);
