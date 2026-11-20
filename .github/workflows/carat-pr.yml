@@ -1,7 +1,7 @@
 # Drop-in GitHub Actions workflow for Carat pull request checks (SPEC section 10.3).
 # Runs strictly from the protected base revision (`pull_request_target`) without ever
 # executing PR head code. Maintainers approve stops by commenting a single standalone line:
-#   carat approve <ledger_id_prefix>
+#   carat approve <ledger_id_prefix> [<ledger_id_prefix> ...]
 name: Carat Dependency Gate
 
 on:
@@ -24,8 +24,8 @@ jobs:
        startsWith(github.event.comment.body, 'carat approve '))
     runs-on: ubuntu-latest
     env:
-      CARAT_RELEASE_URL: "https://github.com/steph4n-gh/carat/releases/download/v0.1.1/carat-x86_64-unknown-linux-gnu.tar.gz"
-      CARAT_SHA256: "4397ace10987a2e5ea812bf32afba28cb716fc2fc177dc7659e290ebed0e7313"
+      CARAT_RELEASE_URL: "https://github.com/steph4n-gh/carat/releases/download/v0.2.0/carat-x86_64-unknown-linux-gnu.tar.gz"
+      CARAT_SHA256: "f1c0c31e8c5f3bf4852a60e11fd69f412e2cd24cecd44cbecfaee2f4fca3b0f3"
     steps:
       - name: Checkout protected base revision (never executes PR head)
         uses: actions/checkout@v4
@@ -50,7 +50,7 @@ jobs:
               repo: context.repo.repo,
               issue_number: prNum,
             });
-            const approveRe = /^carat approve [0-9a-fA-F]{16,64}$/;
+            const approveRe = /^carat approve [0-9a-fA-F]{16,64}(?: +[0-9a-fA-F]{16,64})*$/;
             const out = [];
             for (const c of comments) {
               const body = (c.body || '').trim();
