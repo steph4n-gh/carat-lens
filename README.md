@@ -12,16 +12,19 @@ Built end-to-end with Carat as the sole installer (`carat add` / `carat add -D`,
 Run any `<pkg>@<from>..<to>` registry transition on demand and inspect byte accounting, provenance anchor metadata, stop rules, and syntax-highlighted inline residual diffs without extracting untrusted tarballs to disk.
 
 ### 2. Store Ledgers (`.carat/`)
-Inspect every recorded transition ledger, decision, and human approval in a repository's `.carat/` store—complete with break/flag/reach badges, filterable file-origin tables, and one-click copyable `carat approve <16-hex>` commands.
+Inspect recorded transition ledgers, decisions, and human approvals in a repository's `.carat/` store—deduplicated to the latest ledger per `subject` (with a full-history toggle), subject-matched approval validation (S10 fact superset check), break/flag/reach badges, filterable file-origin tables, and a **read-only Batch Approve Command Builder** that lets you check unapproved stops to copy a single `carat approve <id1> <id2> ...` command.
 
 ![Carat Lens — Store Ledgers balance sheet view](docs/screenshot-store.png)
 
-### 3. Lockfile Inventory (`carat inventory`)
+### 3. Git Diff (`carat check`)
+Compare `package-lock.json` across any two Git commits or branches directly in the browser (pre-populated from `git log -- package-lock.json`), showing gate pass/stop status, shortest introducer routes, and inline residual diffs.
+
+### 4. Lockfile Inventory (`carat inventory`)
 Audit standing lockfile health (`package-lock.json` v3): total package instances, missing SHA-512 integrity hashes, non-registry sources, and searchable package paths.
 
 ![Carat Lens — Lockfile Inventory view](docs/screenshot-inventory.png)
 
-### 4. Exposure Search (`carat exposure`)
+### 5. Exposure Search (`carat exposure`)
 Trace historical admission windows for any `<name>@<version>` across Git lockfile history and the local `.carat/` store.
 
 ---

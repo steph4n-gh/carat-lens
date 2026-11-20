@@ -1,19 +1,56 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type {
+  CheckResult,
   ExplainResult,
   ExposureResult,
+  GitCommit,
   InventoryResult,
   StoreEntry,
 } from "../shared/schema";
 import { BalanceSheet, VerdictPill, formatBytes } from "./components/BalanceSheet";
 
-type Tab = "store" | "explain" | "inventory" | "exposure";
+type Tab = "store" | "gitdiff" | "explain" | "inventory" | "exposure";
 
 interface ProjectChoice {
   readonly name: string;
   readonly path: string;
   readonly hasLockfile: boolean;
   readonly hasStore: boolean;
+}
+
+function dedupeBySubject(entries: readonly StoreEntry[]): StoreEntry[] {
+  const bestBySubject = new Map<string, StoreEntry>();
+  for (const entry of entries) {
+    const subj = entry.ledger.subject;
+    const prev = bestBySubject.get(subj);
+    if (!prev) {
+      bestBySubject.set(subj, entry);
+      continue;
+    }
+    const prevTime = prev.decision?.as_of ?? prev.ledger.new.published_at ?? "";
+    const curTime = entry.decision?.as_of ?? entry.ledger.new.published_at ?? "";
+    if (
+      curTime > prevTime ||
+      (curTime === prevTime && entry.ledger.tool_version > prev.ledger.tool_version)
+    ) {
+      bestBySubject.set(subj, entry);
+    }
+  }
+  const deduped = [...bestBySubject.values()];
+  deduped.sort((a, b) => {
+    const rank = (e: StoreEntry): number => {
+      if (e.decision?.verdict === "stop" && !e.approval_valid) return 0;
+      if (e.decision?.verdict === "stop") return 1;
+      if (e.decision?.verdict === "read") return 2;
+      return 3;
+    };
+    const r = rank(a) - rank(b);
+    if (r !== 0) return r;
+    const at = a.decision?.as_of ?? a.ledger.new.published_at ?? "";
+    const bt = b.decision?.as_of ?? b.ledger.new.published_at ?? "";
+    return bt.localeCompare(at);
+  });
+  return deduped;
 }
 
 export function App() {
@@ -23,10 +60,21 @@ export function App() {
   const [projects, setProjects] = useState<ProjectChoice[]>([]);
 
   const [storeEntries, setStoreEntries] = useState<StoreEntry[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
   const [selectedLedgerId, setSelectedLedgerId] = useState<string | null>(null);
-  const [storeFilter, setStoreFilter] = useState<"all" | "stops" | "explained">("all");
+  const [storeFilter, setStoreFilter] = useState<"all" | "stops" | "approved" | "explained">("all");
+  const [checkedStopIds, setCheckedStopIds] = useState<Set<string>>(() => new Set());
+  const [batchCopied, setBatchCopied] = useState(false);
   const [storeLoading, setStoreLoading] = useState(false);
   const [storeError, setStoreError] = useState<string | null>(null);
+
+  const [gitCommits, setGitCommits] = useState<GitCommit[]>([]);
+  const [baseRef, setBaseRef] = useState("HEAD~1");
+  const [headRef, setHeadRef] = useState("HEAD");
+  const [diffResult, setDiffResult] = useState<CheckResult | null>(null);
+  const [selectedDiffIdx, setSelectedDiffIdx] = useState(0);
+  const [diffLoading, setDiffLoading] = useState(false);
+  const [diffError, setDiffError] = useState<string | null>(null);
 
   const [explainSpec, setExplainSpec] = useState("chalk@5.4.0..5.4.1");
   const [explainResult, setExplainResult] = useState<ExplainResult | null>(null);
@@ -56,15 +104,37 @@ export function App() {
       }
       const entries: StoreEntry[] = json.entries ?? [];
       setStoreEntries(entries);
+      setCheckedStopIds(new Set());
+      const deduped = dedupeBySubject(entries);
       setSelectedLedgerId((prev) =>
         prev && entries.some((e) => e.ledger_id === prev)
           ? prev
-          : entries[0]?.ledger_id ?? null,
+          : deduped[0]?.ledger_id ?? entries[0]?.ledger_id ?? null,
       );
     } catch (err: unknown) {
       setStoreError(err instanceof Error ? err.message : "Network error");
     } finally {
       setStoreLoading(false);
+    }
+  }, []);
+
+  const loadGitCommits = useCallback(async (dir: string) => {
+    try {
+      const res = await fetch(`/api/git-commits?dir=${encodeURIComponent(dir)}`);
+      const json = await res.json();
+      if (res.ok && Array.isArray(json.commits)) {
+        const commits: GitCommit[] = json.commits;
+        setGitCommits(commits);
+        if (commits.length >= 2 && commits[0] && commits[1]) {
+          setHeadRef(commits[0].shortHash);
+          setBaseRef(commits[1].shortHash);
+        } else if (commits.length === 1 && commits[0]) {
+          setHeadRef(commits[0].shortHash);
+          setBaseRef("HEAD~1");
+        }
+      }
+    } catch {
+      setGitCommits([]);
     }
   }, []);
 
@@ -104,17 +174,43 @@ export function App() {
     void (async () => {
       const current = await loadProjects();
       if (current) {
-        await loadStore(current);
+        await Promise.all([loadStore(current), loadGitCommits(current)]);
       }
     })();
-  }, [loadProjects, loadStore]);
+  }, [loadProjects, loadStore, loadGitCommits]);
 
   async function switchProject(nextDir: string) {
     const resolved = await loadProjects(nextDir);
     if (!resolved) return;
-    await loadStore(resolved);
+    setDiffResult(null);
+    await Promise.all([loadStore(resolved), loadGitCommits(resolved)]);
     if (tab === "inventory") {
       await loadInventory(resolved);
+    }
+  }
+
+  async function handleCheckGit(e: React.FormEvent) {
+    e.preventDefault();
+    setDiffLoading(true);
+    setDiffError(null);
+    try {
+      const res = await fetch("/api/check-git", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectDir, baseRef, headRef }),
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        setDiffError(json.error || "Git diff check failed");
+        return;
+      }
+      setDiffResult(json.result);
+      setSelectedDiffIdx(0);
+      await loadStore(projectDir);
+    } catch (err: unknown) {
+      setDiffError(err instanceof Error ? err.message : "Network error");
+    } finally {
+      setDiffLoading(false);
     }
   }
 
@@ -165,30 +261,79 @@ export function App() {
     }
   }
 
+  const activeStorePool = useMemo(
+    () => (showHistory ? storeEntries : dedupeBySubject(storeEntries)),
+    [storeEntries, showHistory],
+  );
+
   const filteredStore = useMemo(() => {
-    return storeEntries.filter((e) => {
-      if (storeFilter === "stops") return e.decision?.verdict === "stop";
+    return activeStorePool.filter((e) => {
+      if (storeFilter === "stops") return e.decision?.verdict === "stop" && !e.approval_valid;
+      if (storeFilter === "approved") return e.decision?.verdict === "stop" && e.approval_valid;
       if (storeFilter === "explained") return e.decision?.verdict === "explained";
       return true;
     });
-  }, [storeEntries, storeFilter]);
+  }, [activeStorePool, storeFilter]);
 
   const selectedEntry = useMemo(
     () => filteredStore.find((e) => e.ledger_id === selectedLedgerId) ?? filteredStore[0] ?? null,
     [filteredStore, selectedLedgerId],
   );
 
+  const visibleUnapprovedStops = useMemo(
+    () => filteredStore.filter((e) => e.decision?.verdict === "stop" && !e.approval_valid),
+    [filteredStore],
+  );
+
+  const batchCommand = useMemo(() => {
+    if (checkedStopIds.size === 0) return "";
+    const ids = [...checkedStopIds].map((id) => id.slice(0, 16));
+    return `carat approve ${ids.join(" ")}`;
+  }, [checkedStopIds]);
+
+  function toggleStopCheck(ledgerId: string) {
+    setCheckedStopIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(ledgerId)) next.delete(ledgerId);
+      else next.add(ledgerId);
+      return next;
+    });
+  }
+
+  async function copyBatchCmd() {
+    if (!batchCommand) return;
+    try {
+      await navigator.clipboard.writeText(batchCommand);
+      setBatchCopied(true);
+      setTimeout(() => setBatchCopied(false), 1800);
+    } catch {
+      // Clipboard unavailable.
+    }
+  }
+
   const filteredInventory = useMemo(() => {
     if (!inventory) return [];
     const q = invSearch.trim().toLowerCase();
     return inventory.packages
-      .filter((p) => !q || p.name.toLowerCase().includes(q) || p.instance_path.toLowerCase().includes(q))
+      .filter(
+        (p) =>
+          !q ||
+          p.name.toLowerCase().includes(q) ||
+          p.instance_path.toLowerCase().includes(q),
+      )
       .slice(0, 250);
   }, [inventory, invSearch]);
 
-  const unapprovedStops = storeEntries.filter(
-    (e) => e.decision?.verdict === "stop" && !e.approval,
-  ).length;
+  const dedupedCount = useMemo(() => dedupeBySubject(storeEntries).length, [storeEntries]);
+  const unapprovedStops = useMemo(
+    () =>
+      dedupeBySubject(storeEntries).filter(
+        (e) => e.decision?.verdict === "stop" && !e.approval_valid,
+      ).length,
+    [storeEntries],
+  );
+
+  const selectedDiffItem = diffResult?.transitions[selectedDiffIdx] ?? null;
 
   return (
     <div className="app-shell">
@@ -245,8 +390,15 @@ export function App() {
           className={`tab ${tab === "store" ? "active" : ""}`}
           onClick={() => setTab("store")}
         >
-          Store Ledgers ({storeEntries.length}
+          Store Ledgers ({dedupedCount}
           {unapprovedStops > 0 ? ` · ${unapprovedStops} stops` : ""})
+        </button>
+        <button
+          type="button"
+          className={`tab ${tab === "gitdiff" ? "active" : ""}`}
+          onClick={() => setTab("gitdiff")}
+        >
+          Git Diff
         </button>
         <button
           type="button"
@@ -278,6 +430,30 @@ export function App() {
         {tab === "store" && (
           <>
             {storeError && <div className="error-banner">{storeError}</div>}
+            {checkedStopIds.size > 0 && (
+              <div className="batch-bar">
+                <strong style={{ fontSize: 13 }}>
+                  Batch approve ({checkedStopIds.size} selected):
+                </strong>
+                <div className="batch-cmd">{batchCommand}</div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={() => void copyBatchCmd()}
+                  >
+                    {batchCopied ? "Copied" : "Copy batch command"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => setCheckedStopIds(new Set())}
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+            )}
             <div className="split">
               <div className="card">
                 <div className="row" style={{ marginBottom: 10 }}>
@@ -293,8 +469,8 @@ export function App() {
                     {storeLoading ? "Refreshing…" : "Refresh"}
                   </button>
                 </div>
-                <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
-                  {(["all", "stops", "explained"] as const).map((f) => (
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+                  {(["all", "stops", "approved", "explained"] as const).map((f) => (
                     <button
                       key={f}
                       type="button"
@@ -305,30 +481,67 @@ export function App() {
                     </button>
                   ))}
                 </div>
-                <div className="list">
-                  {filteredStore.map((entry) => (
+                <div className="row" style={{ marginBottom: 10 }}>
+                  <label className="toggle-label">
+                    <input
+                      type="checkbox"
+                      checked={showHistory}
+                      onChange={(e) => setShowHistory(e.target.checked)}
+                    />
+                    Show history ({storeEntries.length})
+                  </label>
+                  {visibleUnapprovedStops.length > 0 && (
                     <button
-                      key={entry.ledger_id}
                       type="button"
-                      className={`list-item ${selectedEntry?.ledger_id === entry.ledger_id ? "selected" : ""}`}
-                      onClick={() => setSelectedLedgerId(entry.ledger_id)}
+                      className="btn"
+                      style={{ padding: "3px 8px", fontSize: 11 }}
+                      onClick={() =>
+                        setCheckedStopIds(
+                          new Set(visibleUnapprovedStops.map((e) => e.ledger_id)),
+                        )
+                      }
                     >
-                      <div className="row">
-                        <strong className="mono">{entry.ledger.name}</strong>
-                        <VerdictPill decision={entry.decision} approval={entry.approval} />
-                      </div>
-                      <div className="muted mono" style={{ fontSize: 12, marginTop: 4 }}>
-                        {entry.ledger.reference?.version ?? "new"} → {entry.ledger.new.version}
-                        {entry.ledger.unexplained_code_bytes > 0
-                          ? ` · ${formatBytes(entry.ledger.unexplained_code_bytes)} unexp`
-                          : ""}
-                      </div>
+                      Select all stops ({visibleUnapprovedStops.length})
                     </button>
-                  ))}
+                  )}
+                </div>
+                <div className="list">
+                  {filteredStore.map((entry) => {
+                    const isUnapprovedStop =
+                      entry.decision?.verdict === "stop" && !entry.approval_valid;
+                    return (
+                      <div key={entry.ledger_id} className="list-item-row">
+                        {isUnapprovedStop && (
+                          <label className="stop-check" title="Include in batch approve command">
+                            <input
+                              type="checkbox"
+                              checked={checkedStopIds.has(entry.ledger_id)}
+                              onChange={() => toggleStopCheck(entry.ledger_id)}
+                            />
+                          </label>
+                        )}
+                        <button
+                          type="button"
+                          className={`list-item ${selectedEntry?.ledger_id === entry.ledger_id ? "selected" : ""}`}
+                          onClick={() => setSelectedLedgerId(entry.ledger_id)}
+                        >
+                          <div className="row">
+                            <strong className="mono">{entry.ledger.name}</strong>
+                            <VerdictPill decision={entry.decision} approval={entry.approval} />
+                          </div>
+                          <div className="muted mono" style={{ fontSize: 12, marginTop: 4 }}>
+                            {entry.ledger.reference?.version ?? "new"} → {entry.ledger.new.version}
+                            {entry.ledger.unexplained_code_bytes > 0
+                              ? ` · ${formatBytes(entry.ledger.unexplained_code_bytes)} unexp`
+                              : ""}
+                          </div>
+                        </button>
+                      </div>
+                    );
+                  })}
                   {!storeLoading && filteredStore.length === 0 && (
                     <div className="muted">
-                      No ledgers found in <code>{projectDir}/.carat/ledgers</code>. Run{" "}
-                      <code>carat add</code>, <code>carat check</code>, or Live Explain.
+                      No matching ledgers in <code>{projectDir}/.carat/ledgers</code>.
                     </div>
                   )}
                 </div>
@@ -348,6 +561,154 @@ export function App() {
               </div>
             </div>
           </>
+        )}
+
+        {tab === "gitdiff" && (
+          <div>
+            <form
+              className="card"
+              style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}
+              onSubmit={(e) => void handleCheckGit(e)}
+            >
+              <label className="muted" style={{ fontSize: 12 }}>
+                Base:
+              </label>
+              <input
+                className="input mono"
+                style={{ width: 140 }}
+                value={baseRef}
+                onChange={(e) => setBaseRef(e.target.value)}
+                list="git-commits-list"
+                placeholder="HEAD~1"
+              />
+              <label className="muted" style={{ fontSize: 12 }}>
+                Head:
+              </label>
+              <input
+                className="input mono"
+                style={{ width: 140 }}
+                value={headRef}
+                onChange={(e) => setHeadRef(e.target.value)}
+                list="git-commits-list"
+                placeholder="HEAD"
+              />
+              <datalist id="git-commits-list">
+                {gitCommits.map((c) => (
+                  <option key={c.hash} value={c.shortHash}>
+                    {c.date.slice(0, 10)} — {c.subject}
+                  </option>
+                ))}
+              </datalist>
+              <button type="submit" className="btn btn-primary" disabled={diffLoading}>
+                {diffLoading ? "Running carat check…" : "Run Carat Check"}
+              </button>
+              {gitCommits.length > 0 && (
+                <span className="muted mono" style={{ fontSize: 12 }}>
+                  {gitCommits.length} lockfile commit(s) found
+                </span>
+              )}
+            </form>
+
+            {diffError && <div className="error-banner">{diffError}</div>}
+
+            {diffResult && (
+              <>
+                <div className="stat-grid">
+                  <div className="stat">
+                    <div className="stat-label">Gate Status</div>
+                    <div
+                      className="stat-value"
+                      style={{ color: diffResult.passed ? "var(--green)" : "var(--red)" }}
+                    >
+                      {diffResult.passed ? "PASSED" : "STOPPED"}
+                    </div>
+                  </div>
+                  <div className="stat">
+                    <div className="stat-label">Changed Packages</div>
+                    <div className="stat-value">{diffResult.transitions.length}</div>
+                  </div>
+                  <div className="stat">
+                    <div className="stat-label">Transition Errors</div>
+                    <div className="stat-value">{diffResult.transition_errors.length}</div>
+                  </div>
+                </div>
+
+                {diffResult.transitions.length === 0 ? (
+                  <div className="card muted">
+                    No changed packages between <code>{baseRef}</code> and <code>{headRef}</code>.
+                  </div>
+                ) : (
+                  <div className="split">
+                    <div className="card">
+                      <div className="card-title">
+                        Transitions ({diffResult.transitions.length})
+                      </div>
+                      <div className="list">
+                        {diffResult.transitions.map((tr, i) => (
+                          <button
+                            key={tr.ledger_id ?? `${tr.ledger.name}-${i}`}
+                            type="button"
+                            className={`list-item ${selectedDiffIdx === i ? "selected" : ""}`}
+                            onClick={() => setSelectedDiffIdx(i)}
+                          >
+                            <div className="row">
+                              <strong className="mono">{tr.ledger.name}</strong>
+                              <VerdictPill
+                                decision={tr.decision}
+                                approval={
+                                  tr.approved_by
+                                    ? {
+                                        kind: "approval",
+                                        schema: 2,
+                                        subject: tr.ledger.subject,
+                                        ledger_id: tr.decision.ledger_id,
+                                        approved_facts: tr.decision.stop_facts,
+                                        approver: tr.approved_by,
+                                        approved_at: tr.decision.as_of,
+                                      }
+                                    : null
+                                }
+                              />
+                            </div>
+                            <div className="muted mono" style={{ fontSize: 12, marginTop: 4 }}>
+                              {tr.ledger.reference?.version ?? "new"} → {tr.ledger.new.version}
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div>
+                      {selectedDiffItem && (
+                        <BalanceSheet
+                          ledgerId={
+                            selectedDiffItem.ledger_id ?? selectedDiffItem.decision.ledger_id
+                          }
+                          ledger={selectedDiffItem.ledger}
+                          decision={selectedDiffItem.decision}
+                          approval={
+                            selectedDiffItem.approved_by
+                              ? {
+                                  kind: "approval",
+                                  schema: 2,
+                                  subject: selectedDiffItem.ledger.subject,
+                                  ledger_id: selectedDiffItem.decision.ledger_id,
+                                  approved_facts: selectedDiffItem.decision.stop_facts,
+                                  approver: selectedDiffItem.approved_by,
+                                  approved_at: selectedDiffItem.decision.as_of,
+                                }
+                              : null
+                          }
+                          residualDiffs={selectedDiffItem.residual_diffs}
+                          route={selectedDiffItem.route}
+                        />
+                      )}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
         )}
 
         {tab === "explain" && (
@@ -430,7 +791,9 @@ export function App() {
                     <div className="stat-label">Missing SHA-512</div>
                     <div
                       className="stat-value"
-                      style={{ color: inventory.missing_integrity > 0 ? "var(--red)" : "var(--green)" }}
+                      style={{
+                        color: inventory.missing_integrity > 0 ? "var(--red)" : "var(--green)",
+                      }}
                     >
                       {inventory.missing_integrity}
                     </div>
@@ -439,7 +802,9 @@ export function App() {
                     <div className="stat-label">Non-Registry</div>
                     <div
                       className="stat-value"
-                      style={{ color: inventory.non_registry > 0 ? "var(--amber)" : "var(--green)" }}
+                      style={{
+                        color: inventory.non_registry > 0 ? "var(--amber)" : "var(--green)",
+                      }}
                     >
                       {inventory.non_registry}
                     </div>
@@ -521,7 +886,9 @@ export function App() {
                               {h.last_commit.slice(0, 10)} ({h.last_date.slice(0, 10)})
                             </td>
                             <td>
-                              <span className={`pill ${h.still_present ? "pill-stop" : "pill-muted"}`}>
+                              <span
+                                className={`pill ${h.still_present ? "pill-stop" : "pill-muted"}`}
+                              >
                                 {h.still_present ? "still present" : "removed"}
                               </span>
                             </td>

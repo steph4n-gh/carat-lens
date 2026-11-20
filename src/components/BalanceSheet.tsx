@@ -90,12 +90,14 @@ export function BalanceSheet({
   decision,
   approval,
   residualDiffs = [],
+  route = [],
 }: {
   ledgerId: string;
   ledger: TransitionLedger;
   decision: Decision | null;
   approval: ApprovalRecord | null;
   residualDiffs?: readonly ResidualDiff[];
+  route?: readonly { readonly from: string; readonly to: string; readonly kind: string }[];
 }) {
   const [copied, setCopied] = useState(false);
   const [classFilter, setClassFilter] = useState<string>("all");
@@ -139,8 +141,13 @@ export function BalanceSheet({
             </span>
           </h2>
           <div className="mono muted" style={{ fontSize: 12, marginTop: 2 }}>
-            ledger {shortId}… · subject {ledger.subject.slice(0, 16)}…
+            ledger {shortId}… · subject {ledger.subject.slice(0, 16)}… · carat {ledger.tool_version}
           </div>
+          {route.length > 0 && (
+            <div className="mono muted" style={{ fontSize: 12, marginTop: 3 }}>
+              route: root → {route.map((r) => r.to).join(" → ")}
+            </div>
+          )}
         </div>
         <VerdictPill decision={decision} approval={approval} />
       </div>

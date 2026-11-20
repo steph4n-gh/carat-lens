@@ -3,11 +3,17 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import fs from "node:fs";
 import path from "node:path";
 import { Hono } from "hono";
-import { ExplainRequestSchema, ExposureRequestSchema } from "../shared/schema.ts";
+import {
+  CheckGitRequestSchema,
+  ExplainRequestSchema,
+  ExposureRequestSchema,
+} from "../shared/schema.ts";
 import {
   discoverNearbyProjects,
+  listLockfileCommits,
   readStoreEntries,
   resolveSafeDir,
+  runCheckGit,
   runExplain,
   runExposure,
   runInventory,
@@ -49,6 +55,54 @@ export function createApp() {
         400,
       );
     }
+  });
+
+  app.get("/api/git-commits", async (c) => {
+    const raw = c.req.query("dir") || DEFAULT_PROJECT_DIR;
+    try {
+      const projectDir = await resolveSafeDir(raw);
+      const commits = await listLockfileCommits(projectDir);
+      return c.json({ projectDir, commits });
+    } catch (err: unknown) {
+      return c.json(
+        { error: err instanceof Error ? err.message : "Invalid directory" },
+        400,
+      );
+    }
+  });
+
+  app.post("/api/check-git", async (c) => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "Invalid JSON body" }, 400);
+    }
+    const parsed = CheckGitRequestSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json(
+        { error: parsed.error.issues.map((i) => i.message).join("; ") },
+        400,
+      );
+    }
+    let projectDir: string;
+    try {
+      projectDir = await resolveSafeDir(parsed.data.projectDir);
+    } catch (err: unknown) {
+      return c.json(
+        { error: err instanceof Error ? err.message : "Invalid directory" },
+        400,
+      );
+    }
+    const outcome = await runCheckGit({
+      projectDir,
+      baseRef: parsed.data.baseRef,
+      headRef: parsed.data.headRef,
+    });
+    if (outcome.kind === "error") {
+      return c.json({ error: outcome.message }, 502);
+    }
+    return c.json({ exitCode: outcome.exitCode, result: outcome.data });
   });
 
   app.get("/api/inventory", async (c) => {

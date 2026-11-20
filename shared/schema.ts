@@ -159,8 +159,40 @@ export const StoreEntrySchema = z.object({
   ledger: TransitionLedgerSchema,
   decision: DecisionSchema.nullable(),
   approval: ApprovalRecordSchema.nullable(),
+  approval_valid: z.boolean().default(false),
 });
 export type StoreEntry = z.infer<typeof StoreEntrySchema>;
+
+export const CheckResultSchema = z.object({
+  passed: z.boolean(),
+  tampered_protected_files: z.array(z.string()).default([]),
+  transition_errors: z.array(z.string()).default([]),
+  transitions: z.array(ExplainResultSchema).default([]),
+});
+export type CheckResult = z.infer<typeof CheckResultSchema>;
+
+export const GitCommitSchema = z.object({
+  hash: z.string(),
+  shortHash: z.string(),
+  date: z.string(),
+  subject: z.string(),
+});
+export type GitCommit = z.infer<typeof GitCommitSchema>;
+
+const SAFE_GIT_REF = /^[A-Za-z0-9][A-Za-z0-9._/~^-]{0,127}$/;
+const SafeGitRefSchema = z
+  .string()
+  .trim()
+  .regex(SAFE_GIT_REF, { message: "Invalid git revision format" })
+  .refine((v) => !v.includes("..") && !v.includes(":"), {
+    message: "Git revision must be a single commit, tag, or branch ref",
+  });
+
+export const CheckGitRequestSchema = z.object({
+  projectDir: z.string().min(1),
+  baseRef: SafeGitRefSchema,
+  headRef: SafeGitRefSchema,
+});
 
 export const InventoryPackageSchema = z.object({
   instance_path: z.string(),

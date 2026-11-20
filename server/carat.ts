@@ -1,19 +1,23 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { z } from "zod";
 import {
   ApprovalRecordSchema,
+  CheckResultSchema,
   DecisionSchema,
   ExplainResultSchema,
   ExposureResultSchema,
   InventoryResultSchema,
   TransitionLedgerSchema,
   type ApprovalRecord,
+  type CheckResult,
   type Decision,
   type ExplainResult,
   type ExposureResult,
+  type GitCommit,
   type InventoryResult,
   type StoreEntry,
 } from "../shared/schema.ts";
@@ -33,7 +37,11 @@ interface ExecFileError {
 }
 
 function isExecFileError(err: unknown): err is ExecFileError {
-  return typeof err === "object" && err !== null && ("code" in err || "stdout" in err || "stderr" in err);
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    ("code" in err || "stdout" in err || "stderr" in err)
+  );
 }
 
 async function runCaratJson<S extends z.ZodTypeAny>(opts: {
@@ -153,6 +161,101 @@ export async function runExposure(opts: {
   });
 }
 
+export async function listLockfileCommits(projectDir: string): Promise<GitCommit[]> {
+  try {
+    const res = await execFileAsync(
+      "git",
+      ["log", "-n", "15", "--format=%H%x1f%h%x1f%aI%x1f%s", "--", "package-lock.json"],
+      {
+        cwd: projectDir,
+        maxBuffer: 2 * 1024 * 1024,
+        timeout: 15_000,
+      },
+    );
+    const commits: GitCommit[] = [];
+    for (const line of res.stdout.split("\n")) {
+      if (!line.trim()) continue;
+      const parts = line.split("\x1f");
+      const hash = parts[0];
+      const shortHash = parts[1];
+      const date = parts[2];
+      const subject = parts[3] ?? "";
+      if (hash && shortHash && date) {
+        commits.push({ hash, shortHash, date, subject });
+      }
+    }
+    return commits;
+  } catch {
+    return [];
+  }
+}
+
+async function gitShowFile(projectDir: string, ref: string, filePath: string): Promise<Buffer | null> {
+  try {
+    const res = await execFileAsync("git", ["show", `${ref}:${filePath}`], {
+      cwd: projectDir,
+      encoding: "buffer",
+      maxBuffer: 32 * 1024 * 1024,
+      timeout: 15_000,
+    });
+    return res.stdout;
+  } catch {
+    return null;
+  }
+}
+
+export async function runCheckGit(opts: {
+  readonly projectDir: string;
+  readonly baseRef: string;
+  readonly headRef: string;
+}): Promise<CaratCommandOutcome<CheckResult>> {
+  const [baseLock, headLock, basePkg, headPkg] = await Promise.all([
+    gitShowFile(opts.projectDir, opts.baseRef, "package-lock.json"),
+    gitShowFile(opts.projectDir, opts.headRef, "package-lock.json"),
+    gitShowFile(opts.projectDir, opts.baseRef, "package.json"),
+    gitShowFile(opts.projectDir, opts.headRef, "package.json"),
+  ]);
+
+  if (!headLock) {
+    return {
+      kind: "error",
+      exitCode: 2,
+      message: `No package-lock.json found at revision ${opts.headRef}`,
+    };
+  }
+
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "carat-lens-diff-"));
+  try {
+    const baseLockPath = path.join(tmpDir, "base-lock.json");
+    const headLockPath = path.join(tmpDir, "head-lock.json");
+    const emptyLock = Buffer.from(
+      JSON.stringify({ name: "empty", lockfileVersion: 3, packages: { "": {} } }),
+    );
+    await fs.writeFile(baseLockPath, baseLock ?? emptyLock);
+    await fs.writeFile(headLockPath, headLock);
+
+    const args = ["check", "--base", baseLockPath, "--head", headLockPath, "--json"];
+    if (basePkg) {
+      const p = path.join(tmpDir, "base-pkg.json");
+      await fs.writeFile(p, basePkg);
+      args.push("--base-pkg", p);
+    }
+    if (headPkg) {
+      const p = path.join(tmpDir, "head-pkg.json");
+      await fs.writeFile(p, headPkg);
+      args.push("--head-pkg", p);
+    }
+
+    return await runCaratJson({
+      args,
+      cwd: opts.projectDir,
+      schema: CheckResultSchema,
+    });
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
 async function readJsonDir<S extends z.ZodTypeAny>(
   dir: string,
   schema: S,
@@ -179,6 +282,21 @@ async function readJsonDir<S extends z.ZodTypeAny>(
   return results;
 }
 
+function isApprovalValidForDecision(
+  approval: ApprovalRecord | null,
+  decision: Decision | null,
+  subject: string,
+): boolean {
+  if (!approval || approval.subject !== subject) {
+    return false;
+  }
+  if (!decision) {
+    return true;
+  }
+  const approvedSet = new Set(approval.approved_facts);
+  return decision.stop_facts.every((fact) => approvedSet.has(fact));
+}
+
 export async function readStoreEntries(projectDir: string): Promise<StoreEntry[]> {
   const storeRoot = path.join(projectDir, ".carat");
   const [ledgers, decisions, approvals] = await Promise.all([
@@ -195,24 +313,31 @@ export async function readStoreEntries(projectDir: string): Promise<StoreEntry[]
     }
   }
 
-  const approvalByLedger = new Map<string, ApprovalRecord>();
+  // Match carat-core semantics: approvals are keyed by transition `subject`.
+  const approvalBySubject = new Map<string, ApprovalRecord>();
   for (const { value } of approvals) {
-    const existing = approvalByLedger.get(value.ledger_id);
+    const existing = approvalBySubject.get(value.subject);
     if (!existing || value.approved_at > existing.approved_at) {
-      approvalByLedger.set(value.ledger_id, value);
+      approvalBySubject.set(value.subject, value);
     }
   }
 
-  const entries: StoreEntry[] = ledgers.map(({ id, value }) => ({
-    ledger_id: id,
-    ledger: value,
-    decision: decisionByLedger.get(id) ?? null,
-    approval: approvalByLedger.get(id) ?? null,
-  }));
+  const entries: StoreEntry[] = ledgers.map(({ id, value }) => {
+    const decision = decisionByLedger.get(id) ?? null;
+    const approval = approvalBySubject.get(value.subject) ?? null;
+    const approval_valid = isApprovalValidForDecision(approval, decision, value.subject);
+    return {
+      ledger_id: id,
+      ledger: value,
+      decision,
+      approval: approval_valid ? approval : null,
+      approval_valid,
+    };
+  });
 
   entries.sort((a, b) => {
     const rank = (e: StoreEntry): number => {
-      if (e.decision?.verdict === "stop" && !e.approval) return 0;
+      if (e.decision?.verdict === "stop" && !e.approval_valid) return 0;
       if (e.decision?.verdict === "stop") return 1;
       if (e.decision?.verdict === "read") return 2;
       return 3;
