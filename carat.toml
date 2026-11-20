@@ -1,0 +1,36 @@
+# Carat configuration (read only from the protected base revision in `carat pr`)
+
+# Releases newer than min_age only pass if 100% deterministically explained.
+min_age = "24h"
+
+# Releases at least settled_age old (with no malicious advisory) do not hard-stop
+# on missing source anchors, though unexplained code bytes are still reviewed.
+settled_age = "30d"
+
+# New direct dependency policy:
+# - "thin_history" (default): stops only on young (<30d) or sparse (<3 prior releases) packages.
+# - "confirm": stops on every brand-new direct dependency for explicit human confirmation.
+# - "check": treats new direct dependencies identically to transitive ones.
+new_direct_dependency = "thin_history"
+
+# Whether transitions that pass the reader are allowed automatically ("allow" | "require_human").
+read_pass = "allow"
+
+# Only run the reader on already-stopped transitions when set to true (default: false).
+read_on_stop = false
+
+# Number of prior releases used to build each package's publishing habit profile.
+history_depth = 20
+
+# Optional additional read-only record stores (e.g. shared team cache).
+stores = []
+
+[reader]
+# Built-in Anthropic reader (uses ANTHROPIC_API_KEY env var):
+model = "claude-opus-5-5"
+effort = "high"
+timeout_secs = 90
+
+# Or plug in any external executable reading a ReadingPacket JSON on stdin
+# and writing findings JSON (`{"findings":[...],"summary":"..."}`) to stdout:
+# command = "/path/to/custom-reader"

@@ -1,0 +1,192 @@
+# Drop-in GitHub Actions workflow for Carat pull request checks (SPEC section 10.3).
+# Runs strictly from the protected base revision (`pull_request_target`) without ever
+# executing PR head code. Maintainers approve stops by commenting a single standalone line:
+#   carat approve <ledger_id_prefix>
+name: Carat Dependency Gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  carat:
+    if: >
+      github.event_name == 'pull_request_target' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, 'carat approve '))
+    runs-on: ubuntu-latest
+    env:
+      CARAT_RELEASE_URL: "https://github.com/steph4n-gh/carat/releases/download/v0.1.1/carat-x86_64-unknown-linux-gnu.tar.gz"
+      CARAT_SHA256: "4397ace10987a2e5ea812bf32afba28cb716fc2fc177dc7659e290ebed0e7313"
+    steps:
+      - name: Checkout protected base revision (never executes PR head)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve PR refs and collaborator approval comments
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNum = context.eventName === 'pull_request_target'
+              ? context.payload.pull_request.number
+              : context.payload.issue.number;
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNum,
+            });
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNum,
+            });
+            const approveRe = /^carat approve [0-9a-fA-F]{16,64}$/;
+            const out = [];
+            for (const c of comments) {
+              const body = (c.body || '').trim();
+              if (!c.user || c.user.type !== 'User' || !approveRe.test(body)) {
+                continue;
+              }
+              let hasWrite = false;
+              try {
+                const perm = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  username: c.user.login,
+                });
+                hasWrite = ['admin', 'maintain', 'write'].includes(perm.data.permission);
+              } catch (_err) {
+                hasWrite = false;
+              }
+              out.push({
+                author: c.user.login,
+                body,
+                has_write_access: hasWrite,
+                created_at: c.created_at,
+              });
+            }
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/pr-comments.json', JSON.stringify(out));
+            const trustedRead = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(pr.author_association || '');
+            core.setOutput('number', String(prNum));
+            core.setOutput('base', pr.base.sha);
+            core.setOutput('head', pr.head.sha);
+            core.setOutput('author', pr.user.login);
+            core.setOutput('trusted_read', trustedRead ? 'true' : 'false');
+
+      - name: Fetch exact PR head commit objects only (no checkout)
+        run: |
+          git fetch --no-tags origin "pull/${{ steps.pr.outputs.number }}/head:refs/carat/pr-head"
+          ACTUAL="$(git rev-parse refs/carat/pr-head)"
+          if [ "${ACTUAL}" != "${{ steps.pr.outputs.head }}" ]; then
+            echo "PR head SHA changed during fetch (${ACTUAL} != ${{ steps.pr.outputs.head }}); aborting to prevent TOCTOU." >&2
+            exit 2
+          fi
+
+      - name: Install SHA-256 pinned Carat release binary
+        run: |
+          if [ -n "${CARAT_BIN:-}" ] && [ -x "${CARAT_BIN}" ]; then
+            cp "${CARAT_BIN}" ./carat
+            exit 0
+          fi
+          if [ "${CARAT_SHA256}" = "REPLACE_WITH_RELEASE_SHA256" ]; then
+            echo "Set CARAT_RELEASE_URL and CARAT_SHA256 in .github/workflows/carat-pr.yml before enabling." >&2
+            exit 2
+          fi
+          curl -q -fsSL --proto '=https' -o /tmp/carat.tar.gz -- "${CARAT_RELEASE_URL}"
+          echo "${CARAT_SHA256}  /tmp/carat.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/carat.tar.gz -C /tmp
+          cp /tmp/carat ./carat
+          chmod +x ./carat
+
+      - name: Run Carat PR gate (single evaluation)
+        id: run
+        env:
+          ANTHROPIC_API_KEY: ${{ steps.pr.outputs.trusted_read == 'true' && secrets.ANTHROPIC_API_KEY || '' }}
+        run: |
+          set +e
+          READ_ARGS=()
+          if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+            READ_ARGS=(--read)
+          fi
+          ./carat pr \
+            --base "${{ steps.pr.outputs.base }}" \
+            --head "${{ steps.pr.outputs.head }}" \
+            --comments-json /tmp/pr-comments.json \
+            --pr-author "${{ steps.pr.outputs.author }}" \
+            --markdown-out /tmp/carat-summary.md \
+            --json \
+            "${READ_ARGS[@]}" > /tmp/carat-report.json
+          STATUS=$?
+          if [ -f /tmp/carat-summary.md ]; then
+            cat /tmp/carat-summary.md
+          fi
+          echo "exit_code=${STATUS}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Post or update PR summary comment and commit status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.existsSync('/tmp/carat-summary.md')
+              ? fs.readFileSync('/tmp/carat-summary.md', 'utf8')
+              : 'Carat PR gate encountered an operational error; see workflow logs.';
+            const marker = '<!-- carat-pr-report -->';
+            const body = `${marker}\n\`\`\`text\n${summary.slice(0, 60000)}\n\`\`\``;
+            const prNum = Number('${{ steps.pr.outputs.number }}');
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNum,
+            });
+            const existing = comments.find(c => (c.body || '').includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNum,
+                body,
+              });
+            }
+            const exitCode = Number('${{ steps.run.outputs.exit_code }}');
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ steps.pr.outputs.head }}',
+              state: exitCode === 0 ? 'success' : 'failure',
+              context: 'Carat Dependency Gate',
+              description: exitCode === 0
+                ? 'All dependency changes passed Carat'
+                : 'Unapproved Carat stop or policy violation (see PR comment)',
+            });
+
+      - name: Upload Carat artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: carat-report
+          path: |
+            /tmp/carat-summary.md
+            /tmp/carat-report.json
+
+      - name: Fail check if unapproved stops remain
+        if: steps.run.outputs.exit_code != '0'
+        run: exit "${{ steps.run.outputs.exit_code }}"

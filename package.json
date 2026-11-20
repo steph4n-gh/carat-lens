@@ -1,0 +1,13 @@
+{
+  "name": "carat-lens",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local visual dependency balance-sheet dashboard for Carat",
+  "scripts": {
+    "dev": "vite",
+    "dev:server": "node --watch server/index.ts",
+    "build": "tsc --noEmit && vite build",
+    "start": "node server/index.ts"
+  }
+}
